@@ -18,20 +18,22 @@ use rs_singleflight::{Group, Outcome};
 
 #[tokio::main]
 async fn main() {
-    let group = Arc::new(Group::<String, String, ()>::new());
     let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_op = Arc::clone(&calls);
+    let group = Group::new(move |key: String| {
+        let calls = Arc::clone(&calls_for_op);
+        async move {
+            assert_eq!(key, "resource");
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<String, ()>("computed value".to_owned())
+        }
+    });
 
     let mut tasks = Vec::new();
     for _ in 0..8 {
-        let group = Arc::clone(&group);
-        let calls = Arc::clone(&calls);
+        let group = group.clone();
         tasks.push(tokio::spawn(async move {
-            group
-                .run("resource".to_owned(), || async {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok("computed value".to_owned())
-                })
-                .await
+            group.run("resource".to_owned()).await
         }));
     }
 
@@ -60,7 +62,10 @@ use rs_singleflight::{Entry, Group};
 
 #[tokio::main]
 async fn main() {
-    let group = Group::<&'static str, usize, ()>::new();
+    let group = Group::new(|key: &'static str| async move {
+        assert_eq!(key, "key");
+        Ok::<usize, ()>(42)
+    });
 
     match group.entry("key") {
         Entry::Leader(leader) => {

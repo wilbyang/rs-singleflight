@@ -62,41 +62,42 @@ impl std::error::Error for WaitError {}
 ///
 /// For a given key, only the leader computes. Duplicate callers subscribe to
 /// the leader's broadcast and receive the same [`Outcome`].
-pub struct Group<K, T, E, S = RandomState> {
+pub struct Group<K, T, E, F, S = RandomState> {
     inner: Arc<Inner<K, T, E, S>>,
+    op: Arc<F>,
 }
 
-impl<K, T, E> Group<K, T, E, RandomState> {
-    pub fn new() -> Self {
-        Self::with_hasher(RandomState::new())
+impl<K, T, E, F, Fut> Group<K, T, E, F, RandomState>
+where
+    F: Fn(K) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    pub fn new(op: F) -> Self {
+        Self::with_hasher(op, RandomState::new())
     }
 }
 
-impl<K, T, E, S> Group<K, T, E, S> {
-    pub fn with_hasher(hasher: S) -> Self {
+impl<K, T, E, F, S> Group<K, T, E, F, S> {
+    pub fn with_hasher(op: F, hasher: S) -> Self {
         Self {
             inner: Arc::new(Inner {
                 calls: Mutex::new(HashMap::with_hasher(hasher)),
             }),
+            op: Arc::new(op),
         }
     }
 }
 
-impl<K, T, E, S> Clone for Group<K, T, E, S> {
+impl<K, T, E, F, S> Clone for Group<K, T, E, F, S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            op: Arc::clone(&self.op),
         }
     }
 }
 
-impl<K, T, E> Default for Group<K, T, E, RandomState> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K, T, E, S> Group<K, T, E, S>
+impl<K, T, E, F, S> Group<K, T, E, F, S>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -118,15 +119,16 @@ where
         Entry::Leader(Leader { call: Some(call) })
     }
 
-    /// Executes `f` once per key while an earlier call is in flight.
-    pub async fn run<F, Fut>(&self, key: K, f: F) -> SharedOutcome<T, E>
+    /// Executes this group's operation once per key while an earlier call is in flight.
+    pub async fn run<Fut>(&self, key: K) -> SharedOutcome<T, E>
     where
-        F: FnOnce() -> Fut,
+        K: Clone,
+        F: Fn(K) -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        match self.entry(key) {
+        match self.entry(key.clone()) {
             Entry::Leader(leader) => {
-                let result = f().await;
+                let result = (self.op)(key).await;
                 leader.complete(result)
             }
             Entry::Subscriber(subscriber) => subscriber
@@ -282,35 +284,50 @@ impl<K, T, E, S> Call<K, T, E, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        future::{Ready, ready},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use tokio::{
         sync::{Barrier, oneshot},
         time::{Duration, sleep, timeout},
     };
 
+    type EntryGroup = Group<&'static str, usize, (), fn(&'static str) -> Ready<Result<usize, ()>>>;
+
+    fn entry_op(_: &'static str) -> Ready<Result<usize, ()>> {
+        ready(Ok(0))
+    }
+
+    fn entry_group() -> EntryGroup {
+        Group::new(entry_op)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn suppresses_duplicate_calls() {
-        let group = Arc::new(Group::<String, String, ()>::new());
         let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_op = Arc::clone(&calls);
+        let group = Arc::new(Group::new(move |key: String| {
+            let calls = Arc::clone(&calls_for_op);
+            async move {
+                assert_eq!(key, "key");
+                calls.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(20)).await;
+                Ok::<String, ()>("value".to_owned())
+            }
+        }));
         let barrier = Arc::new(Barrier::new(12));
         let mut tasks = Vec::new();
 
         for _ in 0..12 {
             let group = Arc::clone(&group);
-            let calls = Arc::clone(&calls);
             let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                group
-                    .run("key".to_owned(), || async {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        sleep(Duration::from_millis(20)).await;
-                        Ok("value".to_owned())
-                    })
-                    .await
+                group.run("key".to_owned()).await
             }));
         }
 
@@ -333,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribers_receive_cancellation_when_leader_is_dropped() {
-        let group = Group::<&'static str, usize, ()>::new();
+        let group = entry_group();
         let leader = match group.entry("key") {
             Entry::Leader(leader) => leader,
             Entry::Subscriber(_) => panic!("first entry must lead"),
@@ -355,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_starts_a_new_leader_without_breaking_old_one() {
-        let group = Group::<&'static str, usize, ()>::new();
+        let group = entry_group();
         let first = match group.entry("key") {
             Entry::Leader(leader) => leader,
             Entry::Subscriber(_) => panic!("first entry must lead"),
@@ -395,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_entry_api_allows_external_compute_placement() {
-        let group = Group::<&'static str, usize, ()>::new();
+        let group = entry_group();
         let (release_tx, release_rx) = oneshot::channel();
 
         let leader = match group.entry("key") {
