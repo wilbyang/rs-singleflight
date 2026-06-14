@@ -1,0 +1,19 @@
+[package]
+name = "rs-singleflight"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Async single-flight request coalescing for Rust."
+readme = "README.md"
+documentation = "https://docs.rs/rs-singleflight"
+license = "BSD-3-Clause"
+keywords = ["singleflight", "coalescing", "deduplication", "async", "tokio"]
+categories = ["asynchronous", "concurrency"]
+exclude = ["singleflight.go", "singleflight_test.go"]
+publish = true
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
