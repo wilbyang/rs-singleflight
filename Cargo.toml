@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Async single-flight request coalescing for Rust."
 readme = "README.md"
+repository = "https://github.com/wilbyang/rs-singleflight"
 documentation = "https://docs.rs/rs-singleflight"
 license = "BSD-3-Clause"
 keywords = ["singleflight", "coalescing", "deduplication", "async", "tokio"]
